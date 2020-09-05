@@ -4,65 +4,6 @@ import numpy as np
 import pycuda.driver as cuda
 import tensorrt as trt
 
-print('import successfully')
-
-class CNN(torch.nn.Module):
-    def __init__(self, num_classes=10,):
-        super(CNN, self).__init__()
-        self.layer1 = torch.nn.Conv2d(3,16,3)
-        self.layer2 = torch.nn.Conv2d(16,64,5)
-        self.relu = torch.nn.ReLU()
-        
-        # TAKE CARE HERE
-        # Ceil_mode must be False, because onnx eporter does NOT support ceil_mode=True
-        self.max_pool = torch.nn.MaxPool2d(kernel_size=3, stride=1, ceil_mode=False) 
-        self.avg_pool = torch.nn.AdaptiveAvgPool2d((1,1)) 
-        
-        self.fc = torch.nn.Linear(64,num_classes)
-        self.batch_size_onnx = 0
-        # FLAG for output ONNX model
-        self.export_to_onnx_mode = False                  
-    def forward_onnx(self, X_in):
-        print("Function forward_onnx called! \n")
-        x = self.layer1(X_in)
-        x = self.relu(x)
-        x = self.max_pool(x)
-        x = self.layer2(x)
-        x = self.relu(x)
-        x = self.avg_pool(x)
-        assert self.batch_size_onnx > 0
-        length_of_fc_layer = 64 # For exporting an onnx model that fit the TensorRT, processes here should be DETERMINISITC!
-        x = x.view(self.batch_size_onnx, length_of_fc_layer) # 
-        x = self.fc(x)
-        return x
-       
-    def forward_default(self, X_in):
-        print("Function forward_default called! \n")
-        x = self.layer1(X_in)
-        x = self.relu(x)
-        x = self.max_pool(x)
-        x = self.layer2(x)
-        x = self.relu(x)
-        x = self.avg_pool(x)
-        
-        # Such an operationt is not deterministic since it would depend on the input and therefore would result in errors
-        length_of_fc_layer = x.size(1) 
-        x = x.view(-1, length_of_fc_layer)
-        
-        x = self.fc(x)
-        return x
-        
-    def __call__(self, *args,**kargs):
-        if self.export_to_onnx_mode:
-            return self.forward_onnx(*args,**kargs)
-        else:
-            return self.forward_default(*args,**kargs)
-
-
-
-
-
-
 TRT_LOGGER = trt.Logger() # This logger is required to build an engine
 
 
@@ -168,35 +109,17 @@ def postprocess_the_outputs(h_outputs, shape_of_output):
 
 
 print('started')
-onnx_model_path = 'model_cnn.onnx'
-pth_model_path  = 'model_cnn.pth'
+onnx_model_path = 'model_backbone.onnx'
 
-# Load the model
-model = CNN(10)
-print('model created')
-# Save the state dict, which will be loaded later
-print('PyTorch model saved to {}\n'.format(pth_model_path))
-torch.save(model.state_dict(), pth_model_path)
 
-# This is for ONNX exporter to track all the operations inside the model
-batch_size_of_dummy_input = 2 # Any size you want
-dummy_input = torch.zeros([batch_size_of_dummy_input, 3, 64, 64], dtype=torch.float32) 
+batch_size_of_dummy_input = 1 # Any size you want
+dummy_input = torch.zeros([batch_size_of_dummy_input, 3, 1024, 2048], dtype=torch.float32) 
 
-model.batch_size_onnx = batch_size_of_dummy_input
-model.export_to_onnx_mode = True
 input_names = [ "input" ]
 output_names = [ "output"] # Multiple inputs and outputs are supported
-with torch.no_grad():
-    # If verbose is set to False. The information below won't displayed
-    torch.onnx.export(model, dummy_input, onnx_model_path, verbose=True, input_names=input_names, output_names=output_names)
-print('ONNX model exported to {}\n'.format(onnx_model_path))
-
 
 import os
 import time
-
-onnx_model_path = 'model_cnn.onnx'
-pytorch_model_path = 'model_cnn.pth'
 
 print('entering into tensorRT')
 # These two modes are dependent on hardwares
@@ -206,7 +129,7 @@ trt_engine_path = './model_fp16_{}_int8_{}.trt'.format(fp16_mode, int8_mode)
 
 
 max_batch_size = 1 # The batch size of input mush be smaller the max_batch_size once the engine is built
-x_input = np.random.rand(max_batch_size, 3, 64, 64).astype(dtype=np.float32) 
+x_input = np.random.rand(max_batch_size, 3, 1024, 2048).astype(dtype=np.float32) 
 
 # Build an engine
 print('building engine')
@@ -232,36 +155,6 @@ print('starting doing inference with tensorRT')
 t1 = time.time()
 trt_outputs = do_inference(context, bindings=bindings, inputs=inputs, outputs=outputs, stream=stream) # numpy data
 t2 = time.time()
-output_from_trt_engine = postprocess_the_outputs(trt_outputs[0], shape_of_output)
 print('done inference using tensorRT')
-
-# Compare with the PyTorch
-print('starting doing inference with torch')
-pth_model = CNN(10)
-pth_model.load_state_dict(torch.load(pytorch_model_path))
-pth_model.cuda()
-
-x_input_pth = torch.from_numpy(x_input).cuda()
-pth_model.export_to_onnx_mode = False
-t3 = time.time()
-output_from_pytorch_model =  pth_model(x_input_pth)
-t4 = time.time()
-output_from_pytorch_model = output_from_pytorch_model.cpu().data.numpy()
-print('done inference using torch')
-
-
-mse = np.mean((output_from_trt_engine - output_from_pytorch_model)**2)
-print("Inference time with the TensorRT engine: {}".format(t2-t1))
-print("Inference time with the PyTorch model: {}".format(t4-t3))
-print('MSE Error = {}'.format(mse))
-
-
-
-docker pull nvcr.io/nvidia/tensorrt:19.06-py3
-docker run --gpus all -it --rm -v local_dir:'/home/ec2-user/SageMaker/realtime_panoptic' nvcr.io/nvidia/tensorrt:19.06-py3
-/opt/tensorrt/python/python_setup.sh
-pip install torch==1.2.0 torchvision==0.4.0
-
-
 
 
